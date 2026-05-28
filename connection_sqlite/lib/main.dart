@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:latlong2/latlong.dart';
 import 'package:path/path.dart' show join;
 import 'package:sqflite/sqflite.dart';
 
@@ -8,9 +10,6 @@ void main() {
   runApp(const MainApp());
 }
 
-// ============================================================
-// MODEL
-// ============================================================
 class Entrega {
   final int? id;
   final String codigo;
@@ -55,9 +54,6 @@ class Entrega {
       );
 }
 
-// ============================================================
-// DATABASE
-// ============================================================
 class DatabaseHelper {
   DatabaseHelper._();
   static final DatabaseHelper instance = DatabaseHelper._();
@@ -97,9 +93,6 @@ class DatabaseHelper {
       (await database).delete('entregas', where: 'id = ?', whereArgs: [id]);
 }
 
-// ============================================================
-// STATUS
-// ============================================================
 const _statusOpcoes = ['pendente', 'saiu para entrega', 'em transporte', 'entregue'];
 
 ({Color color, IconData icon}) _statusInfo(String s) => switch (s) {
@@ -128,10 +121,6 @@ String _fmtData(String iso) {
     return iso;
   }
 }
-
-// ============================================================
-// APP
-// ============================================================
 class MainApp extends StatelessWidget {
   const MainApp({super.key});
 
@@ -167,9 +156,6 @@ class MainApp extends StatelessWidget {
   }
 }
 
-// ============================================================
-// HOME
-// ============================================================
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
   @override
@@ -194,6 +180,12 @@ class _HomeScreenState extends State<HomeScreen> {
       MaterialPageRoute(builder: (_) => EntregaFormScreen(entrega: entrega)),
     );
     if (ok == true) _recarregar();
+  }
+
+  Future<void> _verNoMapa(Entrega e) async {
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => MapaVisualizacaoScreen(entrega: e)),
+    );
   }
 
   Future<void> _excluir(Entrega e) async {
@@ -236,7 +228,9 @@ class _HomeScreenState extends State<HomeScreen> {
           if (snap.connectionState == ConnectionState.waiting) {
             return const Center(child: CircularProgressIndicator());
           }
-          if (snap.hasError) return Center(child: Text('Erro: ${snap.error}'));
+          if (snap.hasError) {
+            return Center(child: Text('Erro: ${snap.error}'));
+          }
           final entregas = snap.data ?? [];
           if (entregas.isEmpty) {
             return Center(
@@ -264,11 +258,12 @@ class _HomeScreenState extends State<HomeScreen> {
             child: ListView.separated(
               padding: const EdgeInsets.fromLTRB(12, 12, 12, 90),
               itemCount: entregas.length,
-              separatorBuilder: (_, _) => const SizedBox(height: 10),
+              separatorBuilder: (_, __) => const SizedBox(height: 10),
               itemBuilder: (_, i) => _EntregaCard(
                 entrega: entregas[i],
                 onTap: () => _abrirForm(entrega: entregas[i]),
                 onDelete: () => _excluir(entregas[i]),
+                onVerMapa: () => _verNoMapa(entregas[i]),
               ),
             ),
           );
@@ -282,18 +277,17 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 }
-
-// ============================================================
-// CARD
-// ============================================================
 class _EntregaCard extends StatelessWidget {
   final Entrega entrega;
   final VoidCallback onTap;
   final VoidCallback onDelete;
+  final VoidCallback onVerMapa;
+
   const _EntregaCard({
     required this.entrega,
     required this.onTap,
     required this.onDelete,
+    required this.onVerMapa,
   });
 
   @override
@@ -360,7 +354,7 @@ class _EntregaCard extends StatelessWidget {
                     Text('#${entrega.codigo}',
                         style: TextStyle(
                             fontSize: 12, color: Colors.grey.shade600)),
-                    const SizedBox(height: 6),
+                    const SizedBox(height: 4),
                     Text(entrega.endereco,
                         style: const TextStyle(fontSize: 13),
                         maxLines: 2,
@@ -373,7 +367,14 @@ class _EntregaCard extends StatelessWidget {
                 ),
               ),
               IconButton(
+                icon: Icon(Icons.map_outlined,
+                    color: Theme.of(context).colorScheme.primary),
+                tooltip: 'Ver no mapa',
+                onPressed: onVerMapa,
+              ),
+              IconButton(
                 icon: Icon(Icons.delete_outline, color: Colors.grey.shade500),
+                tooltip: 'Excluir',
                 onPressed: onDelete,
               ),
             ],
@@ -384,9 +385,405 @@ class _EntregaCard extends StatelessWidget {
   }
 }
 
-// ============================================================
-// FORM
-// ============================================================
+class MapaVisualizacaoScreen extends StatefulWidget {
+  final Entrega entrega;
+  const MapaVisualizacaoScreen({super.key, required this.entrega});
+
+  @override
+  State<MapaVisualizacaoScreen> createState() => _MapaVisualizacaoScreenState();
+}
+
+class _MapaVisualizacaoScreenState extends State<MapaVisualizacaoScreen> {
+  final MapController _mapController = MapController();
+  LatLng? _minhaLocalizacao;
+
+  @override
+  void initState() {
+    super.initState();
+    _obterMinhaLocalizacao();
+  }
+
+  Future<void> _obterMinhaLocalizacao() async {
+    try {
+      var p = await Geolocator.checkPermission();
+      if (p == LocationPermission.denied) {
+        p = await Geolocator.requestPermission();
+      }
+      if (p == LocationPermission.denied ||
+          p == LocationPermission.deniedForever) return;
+
+      final pos = await Geolocator.getCurrentPosition();
+      if (mounted) {
+        setState(() {
+          _minhaLocalizacao = LatLng(pos.latitude, pos.longitude);
+        });
+      }
+    } catch (_) {}
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final destino = LatLng(widget.entrega.latitude, widget.entrega.longitude);
+    final info = _statusInfo(widget.entrega.status);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Entrega #${widget.entrega.codigo}'),
+        backgroundColor: Theme.of(context).colorScheme.primary,
+        foregroundColor: Colors.white,
+        elevation: 0,
+      ),
+      body: Stack(
+        children: [
+          FlutterMap(
+            mapController: _mapController,
+            options: MapOptions(
+              initialCenter: destino,
+              initialZoom: 15,
+            ),
+            children: [
+              TileLayer(
+                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                userAgentPackageName: 'com.example.connection_sqlite',
+              ),
+              MarkerLayer(
+                markers: [
+                  Marker(
+                    point: destino,
+                    width: 40,
+                    height: 40,
+                    child: Icon(Icons.location_pin, color: info.color, size: 40),
+                  ),
+                  if (_minhaLocalizacao != null)
+                    Marker(
+                      point: _minhaLocalizacao!,
+                      width: 40,
+                      height: 40,
+                      child: const Icon(Icons.location_pin, color: Color(0xFF2563EB), size: 40),
+                    ),
+                ],
+              ),
+            ],
+          ),
+          Positioned(
+            left: 12,
+            right: 12,
+            bottom: 20,
+            child: Card(
+              elevation: 4,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16)),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: info.color.withValues(alpha: .12),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Icon(info.icon, color: info.color, size: 20),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                widget.entrega.destinatario,
+                                style: const TextStyle(
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.w700),
+                              ),
+                              Text(
+                                '#${widget.entrega.codigo}',
+                                style: TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.grey.shade600),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: info.color.withValues(alpha: .12),
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: Text(
+                            widget.entrega.status,
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                              color: info.color,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Icon(Icons.place_outlined,
+                            size: 14, color: Colors.grey.shade500),
+                        const SizedBox(width: 4),
+                        Expanded(
+                          child: Text(
+                            widget.entrega.endereco,
+                            style: TextStyle(
+                                fontSize: 13, color: Colors.grey.shade700),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        Icon(Icons.location_on_outlined,
+                            size: 14, color: Colors.grey.shade500),
+                        const SizedBox(width: 4),
+                        Text(
+                          '${widget.entrega.latitude.toStringAsFixed(5)}, '
+                          '${widget.entrega.longitude.toStringAsFixed(5)}',
+                          style: TextStyle(
+                              fontSize: 12, color: Colors.grey.shade500),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          Positioned(
+            right: 12,
+            top: 12,
+            child: FloatingActionButton.small(
+              heroTag: 'center',
+              onPressed: () {
+                _mapController.move(destino, 15);
+              },
+              tooltip: 'Centralizar no destino',
+              child: const Icon(Icons.center_focus_strong),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class MapaSelecionarScreen extends StatefulWidget {
+  final LatLng? inicial;
+  const MapaSelecionarScreen({super.key, this.inicial});
+
+  @override
+  State<MapaSelecionarScreen> createState() => _MapaSelecionarScreenState();
+}
+
+class _MapaSelecionarScreenState extends State<MapaSelecionarScreen> {
+  LatLng? _selecionado;
+  bool _carregandoLoc = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _selecionado = widget.inicial;
+  }
+
+  Future<void> _irParaMinhaLocalizacao(MapController ctrl) async {
+    setState(() => _carregandoLoc = true);
+    try {
+      var p = await Geolocator.checkPermission();
+      if (p == LocationPermission.denied) {
+        p = await Geolocator.requestPermission();
+      }
+      if (p == LocationPermission.denied ||
+          p == LocationPermission.deniedForever) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Permissão de localização negada.')),
+          );
+        }
+        return;
+      }
+      final pos = await Geolocator.getCurrentPosition();
+      final loc = LatLng(pos.latitude, pos.longitude);
+      ctrl.move(loc, 16);
+      setState(() => _selecionado = loc);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Erro: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _carregandoLoc = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ctrl = MapController();
+    final centro = _selecionado ?? const LatLng(-15.7801, -47.9292);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Selecionar localização'),
+        backgroundColor: Theme.of(context).colorScheme.primary,
+        foregroundColor: Colors.white,
+        elevation: 0,
+        actions: [
+          if (_selecionado != null)
+            TextButton.icon(
+              onPressed: () => Navigator.of(context).pop(_selecionado),
+              icon: const Icon(Icons.check, color: Colors.white),
+              label: const Text('Confirmar',
+                  style: TextStyle(color: Colors.white)),
+            ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          FlutterMap(
+            mapController: ctrl,
+            options: MapOptions(
+              initialCenter: centro,
+              initialZoom: 14,
+              onTap: (_, point) {
+                setState(() => _selecionado = point);
+              },
+            ),
+            children: [
+              TileLayer(
+                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                userAgentPackageName: 'com.example.connection_sqlite',
+              ),
+              if (_selecionado != null)
+                MarkerLayer(
+                  markers: [
+                    Marker(
+                      point: _selecionado!,
+                      width: 40,
+                      height: 40,
+                      child: Builder(
+                        builder: (context) => Icon(
+                          Icons.location_pin,
+                          color: Theme.of(context).colorScheme.primary,
+                          size: 40,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+            ],
+          ),
+          Positioned(
+            top: 12,
+            left: 12,
+            right: 12,
+            child: Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(12),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: .08),
+                    blurRadius: 8,
+                  ),
+                ],
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.touch_app_outlined,
+                      color: Theme.of(context).colorScheme.primary, size: 18),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      'Toque no mapa para marcar a localização de entrega',
+                      style: TextStyle(fontSize: 13),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Positioned(
+            right: 12,
+            bottom: _selecionado != null ? 90 : 20,
+            child: FloatingActionButton.small(
+              heroTag: 'myLoc',
+              onPressed: _carregandoLoc
+                  ? null
+                  : () => _irParaMinhaLocalizacao(ctrl),
+              tooltip: 'Minha localização',
+              child: _carregandoLoc
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.my_location),
+            ),
+          ),
+          if (_selecionado != null)
+            Positioned(
+              left: 12,
+              right: 12,
+              bottom: 20,
+              child: Card(
+                elevation: 4,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14)),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+                  child: Row(
+                    children: [
+                      Icon(Icons.location_on,
+                          color: Theme.of(context).colorScheme.primary),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Text('Local selecionado',
+                                style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600)),
+                            Text(
+                              'Lat: ${_selecionado!.latitude.toStringAsFixed(5)}  '
+                              'Lng: ${_selecionado!.longitude.toStringAsFixed(5)}',
+                              style: TextStyle(
+                                  fontSize: 12, color: Colors.grey.shade600),
+                            ),
+                          ],
+                        ),
+                      ),
+                      FilledButton(
+                        onPressed: () =>
+                            Navigator.of(context).pop(_selecionado),
+                        child: const Text('Usar'),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
 class EntregaFormScreen extends StatefulWidget {
   final Entrega? entrega;
   const EntregaFormScreen({super.key, this.entrega});
@@ -431,7 +828,30 @@ class _EntregaFormScreenState extends State<EntregaFormScreen> {
 
   void _msg(String t) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(t)));
+  }
+
+  Future<void> _selecionarNoMapa() async {
+    LatLng? inicial;
+    final lat = double.tryParse(_latCtrl.text.replaceAll(',', '.'));
+    final lng = double.tryParse(_lngCtrl.text.replaceAll(',', '.'));
+    if (lat != null && lng != null) {
+      inicial = LatLng(lat, lng);
+    }
+
+    final resultado = await Navigator.of(context).push<LatLng>(
+      MaterialPageRoute(
+        builder: (_) => MapaSelecionarScreen(inicial: inicial),
+      ),
+    );
+
+    if (resultado != null) {
+      setState(() {
+        _latCtrl.text = resultado.latitude.toStringAsFixed(6);
+        _lngCtrl.text = resultado.longitude.toStringAsFixed(6);
+      });
+    }
   }
 
   Future<void> _capturarLoc() async {
@@ -442,7 +862,9 @@ class _EntregaFormScreenState extends State<EntregaFormScreen> {
         return;
       }
       var p = await Geolocator.checkPermission();
-      if (p == LocationPermission.denied) p = await Geolocator.requestPermission();
+      if (p == LocationPermission.denied) {
+        p = await Geolocator.requestPermission();
+      }
       if (p == LocationPermission.denied ||
           p == LocationPermission.deniedForever) {
         _msg('Permissão de localização negada.');
@@ -452,8 +874,10 @@ class _EntregaFormScreenState extends State<EntregaFormScreen> {
         locationSettings:
             const LocationSettings(accuracy: LocationAccuracy.high),
       );
-      _latCtrl.text = pos.latitude.toString();
-      _lngCtrl.text = pos.longitude.toString();
+      setState(() {
+        _latCtrl.text = pos.latitude.toStringAsFixed(6);
+        _lngCtrl.text = pos.longitude.toStringAsFixed(6);
+      });
     } catch (e) {
       _msg('Erro ao obter localização: $e');
     } finally {
@@ -471,7 +895,8 @@ class _EntregaFormScreenState extends State<EntregaFormScreen> {
       endereco: _enderecoCtrl.text.trim(),
       status: _status,
       latitude: double.tryParse(_latCtrl.text.replaceAll(',', '.')) ?? 0,
-      longitude: double.tryParse(_lngCtrl.text.replaceAll(',', '.')) ?? 0,
+      longitude:
+          double.tryParse(_lngCtrl.text.replaceAll(',', '.')) ?? 0,
       dataEntrega: DateTime.now().toIso8601String(),
     );
     if (widget.entrega == null) {
@@ -487,7 +912,9 @@ class _EntregaFormScreenState extends State<EntregaFormScreen> {
 
   String? _num(String? v) {
     if (v == null || v.trim().isEmpty) return 'Campo obrigatório';
-    if (double.tryParse(v.replaceAll(',', '.')) == null) return 'Número inválido';
+    if (double.tryParse(v.replaceAll(',', '.')) == null) {
+      return 'Número inválido';
+    }
     return null;
   }
 
@@ -540,9 +967,11 @@ class _EntregaFormScreenState extends State<EntregaFormScreen> {
                 prefixIcon: Icon(Icons.label_outline),
               ),
               items: _statusOpcoes
-                  .map((s) => DropdownMenuItem(value: s, child: Text(s)))
+                  .map((s) =>
+                      DropdownMenuItem(value: s, child: Text(s)))
                   .toList(),
-              onChanged: (v) => setState(() => _status = v ?? 'pendente'),
+              onChanged: (v) =>
+                  setState(() => _status = v ?? 'pendente'),
             ),
             const SizedBox(height: 12),
             Row(
@@ -550,7 +979,9 @@ class _EntregaFormScreenState extends State<EntregaFormScreen> {
                 Expanded(
                   child: TextFormField(
                     controller: _latCtrl,
-                    decoration: const InputDecoration(labelText: 'Latitude'),
+                    decoration: const InputDecoration(
+                      labelText: 'Latitude',
+                    ),
                     keyboardType: const TextInputType.numberWithOptions(
                         signed: true, decimal: true),
                     validator: _num,
@@ -560,7 +991,9 @@ class _EntregaFormScreenState extends State<EntregaFormScreen> {
                 Expanded(
                   child: TextFormField(
                     controller: _lngCtrl,
-                    decoration: const InputDecoration(labelText: 'Longitude'),
+                    decoration: const InputDecoration(
+                      labelText: 'Longitude',
+                    ),
                     keyboardType: const TextInputType.numberWithOptions(
                         signed: true, decimal: true),
                     validator: _num,
@@ -569,6 +1002,18 @@ class _EntregaFormScreenState extends State<EntregaFormScreen> {
               ],
             ),
             const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: _selecionarNoMapa,
+              icon: const Icon(Icons.map_outlined),
+              label: const Text('Selecionar no mapa'),
+              style: FilledButton.styleFrom(
+                backgroundColor:
+                    Theme.of(context).colorScheme.secondaryContainer,
+                foregroundColor:
+                    Theme.of(context).colorScheme.onSecondaryContainer,
+              ),
+            ),
+            const SizedBox(height: 8),
             OutlinedButton.icon(
               onPressed: _obtendoLoc ? null : _capturarLoc,
               icon: _obtendoLoc
@@ -578,7 +1023,7 @@ class _EntregaFormScreenState extends State<EntregaFormScreen> {
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
                   : const Icon(Icons.my_location),
-              label: const Text('Usar localização atual'),
+              label: const Text('Usar localização atual (GPS)'),
             ),
           ],
         ),
