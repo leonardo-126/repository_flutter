@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "660551058841",
+    "project_id": "aula1-firebase-6a0ec",
+    "storage_bucket": "aula1-firebase-6a0ec.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:660551058841:android:03478e72a1cf44fa207f08",
+        "android_client_info": {
+          "package_name": "com.example.connection_sqlite"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA7Tlg6BW1kOrfU2iXKZX7BqJQSWuiYOIA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

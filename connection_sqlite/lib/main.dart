@@ -1,3 +1,6 @@
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
@@ -5,13 +8,34 @@ import 'package:latlong2/latlong.dart';
 import 'package:path/path.dart' show join;
 import 'package:sqflite/sqflite.dart';
 
-void main() {
+import 'crud/fetch_data.dart';
+import 'crud/insert_data.dart';
+import 'crud/update_data.dart';
+import 'firebase_options.dart';
+
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Inicializa o Firebase. Se falhar (ex.: sem configuração na plataforma),
+  // o app continua funcionando apenas com o SQLite local.
+  try {
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
+    // Cache offline nativo do Realtime Database (Android/iOS):
+    // mantém os últimos dados e enfileira escritas feitas offline.
+    if (!kIsWeb) {
+      FirebaseDatabase.instance.setPersistenceEnabled(true);
+    }
+  } catch (e) {
+    debugPrint('Firebase indisponível, usando apenas SQLite: $e');
+  }
   runApp(const MainApp());
 }
 
 class Entrega {
-  final int? id;
+  /// Chave única compartilhada pelos dois bancos (SQLite e Realtime Database),
+  /// o que mantém os dois sempre sincronizados pelo mesmo identificador.
+  final String id;
   final String codigo;
   final String destinatario;
   final String endereco;
@@ -21,7 +45,7 @@ class Entrega {
   final String dataEntrega;
 
   Entrega({
-    this.id,
+    required this.id,
     required this.codigo,
     required this.destinatario,
     required this.endereco,
@@ -43,7 +67,7 @@ class Entrega {
       };
 
   factory Entrega.fromMap(Map<String, dynamic> map) => Entrega(
-        id: map['id'] as int?,
+        id: map['id'].toString(),
         codigo: map['codigo'] as String,
         destinatario: map['destinatario'] as String,
         endereco: map['endereco'] as String,
@@ -54,6 +78,8 @@ class Entrega {
       );
 }
 
+/// Acesso ao banco local SQLite. Funciona como cache offline: tudo que vem do
+/// Firebase é espelhado aqui para ser exibido quando não houver conexão.
 class DatabaseHelper {
   DatabaseHelper._();
   static final DatabaseHelper instance = DatabaseHelper._();
@@ -64,33 +90,49 @@ class DatabaseHelper {
         join(await getDatabasesPath(), 'entrega_database.db'),
         onCreate: (db, _) => db.execute(
           'CREATE TABLE entregas('
-          'id INTEGER PRIMARY KEY AUTOINCREMENT, '
+          'id TEXT PRIMARY KEY, '
           'codigo TEXT, destinatario TEXT, endereco TEXT, status TEXT, '
           'latitude REAL, longitude REAL, dataEntrega TEXT)',
         ),
-        version: 1,
+        version: 2,
       );
 
-  Future<int> insertEntrega(Entrega e) async => (await database).insert(
+  /// Insere ou atualiza (mesmo id sobrescreve) uma entrega.
+  Future<void> upsertEntrega(Entrega e) async => (await database).insert(
         'entregas',
         e.toMap(),
         conflictAlgorithm: ConflictAlgorithm.replace,
       );
 
   Future<List<Entrega>> getEntregas() async {
-    final maps = await (await database).query('entregas', orderBy: 'id DESC');
+    final maps =
+        await (await database).query('entregas', orderBy: 'dataEntrega DESC');
     return maps.map(Entrega.fromMap).toList();
   }
 
-  Future<int> updateEntrega(Entrega e) async => (await database).update(
-        'entregas',
-        e.toMap(),
-        where: 'id = ?',
-        whereArgs: [e.id],
-      );
-
-  Future<int> deleteEntrega(int id) async =>
+  Future<void> deleteEntrega(String id) async =>
       (await database).delete('entregas', where: 'id = ?', whereArgs: [id]);
+
+  /// Substitui todo o conteúdo local pela lista vinda do Firebase, mantendo
+  /// o SQLite como espelho fiel do banco remoto.
+  Future<void> replaceAll(List<Entrega> entregas) async {
+    final db = await database;
+    final batch = db.batch();
+    batch.delete('entregas');
+    for (final e in entregas) {
+      batch.insert('entregas', e.toMap(),
+          conflictAlgorithm: ConflictAlgorithm.replace);
+    }
+    await batch.commit(noResult: true);
+  }
+}
+
+/// Resultado emitido pelo repositório: a lista de entregas e se os dados estão
+/// vindo do Firebase em tempo real (online) ou do cache local (offline).
+class EntregaSnapshot {
+  final List<Entrega> entregas;
+  final bool online;
+  const EntregaSnapshot(this.entregas, {required this.online});
 }
 
 const _statusOpcoes = ['pendente', 'saiu para entrega', 'em transporte', 'entregue'];
@@ -163,23 +205,19 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  late Future<List<Entrega>> _future;
+  late final Stream<EntregaSnapshot> _stream;
 
   @override
   void initState() {
     super.initState();
-    _recarregar();
+    _stream = observarEntregas();
   }
 
-  void _recarregar() => setState(() {
-        _future = DatabaseHelper.instance.getEntregas();
-      });
-
   Future<void> _abrirForm({Entrega? entrega}) async {
-    final ok = await Navigator.of(context).push<bool>(
+    // O stream em tempo real já atualiza a lista sozinho após salvar.
+    await Navigator.of(context).push<bool>(
       MaterialPageRoute(builder: (_) => EntregaFormScreen(entrega: entrega)),
     );
-    if (ok == true) _recarregar();
   }
 
   Future<void> _verNoMapa(Entrega e) async {
@@ -189,7 +227,6 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _excluir(Entrega e) async {
-    if (e.id == null) return;
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -208,10 +245,27 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
     if (ok == true) {
-      await DatabaseHelper.instance.deleteEntrega(e.id!);
-      _recarregar();
+      await excluirEntrega(e.id);
     }
   }
+
+  Widget _vazio() => Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.inbox_outlined, size: 56, color: Colors.grey.shade400),
+              const SizedBox(height: 12),
+              const Text('Nenhuma entrega cadastrada',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 4),
+              Text('Toque em + para adicionar',
+                  style: TextStyle(color: Colors.grey.shade600)),
+            ],
+          ),
+        ),
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -222,50 +276,33 @@ class _HomeScreenState extends State<HomeScreen> {
         foregroundColor: Colors.white,
         elevation: 0,
       ),
-      body: FutureBuilder<List<Entrega>>(
-        future: _future,
+      body: StreamBuilder<EntregaSnapshot>(
+        stream: _stream,
         builder: (context, snap) {
-          if (snap.connectionState == ConnectionState.waiting) {
+          if (!snap.hasData) {
             return const Center(child: CircularProgressIndicator());
           }
-          if (snap.hasError) {
-            return Center(child: Text('Erro: ${snap.error}'));
-          }
-          final entregas = snap.data ?? [];
-          if (entregas.isEmpty) {
-            return Center(
-              child: Padding(
-                padding: const EdgeInsets.all(32),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(Icons.inbox_outlined,
-                        size: 56, color: Colors.grey.shade400),
-                    const SizedBox(height: 12),
-                    const Text('Nenhuma entrega cadastrada',
-                        style: TextStyle(
-                            fontSize: 16, fontWeight: FontWeight.w600)),
-                    const SizedBox(height: 4),
-                    Text('Toque em + para adicionar',
-                        style: TextStyle(color: Colors.grey.shade600)),
-                  ],
-                ),
+          final online = snap.data!.online;
+          final entregas = snap.data!.entregas;
+          return Column(
+            children: [
+              _BannerConexao(online: online),
+              Expanded(
+                child: entregas.isEmpty
+                    ? _vazio()
+                    : ListView.separated(
+                        padding: const EdgeInsets.fromLTRB(12, 12, 12, 90),
+                        itemCount: entregas.length,
+                        separatorBuilder: (_, __) => const SizedBox(height: 10),
+                        itemBuilder: (_, i) => _EntregaCard(
+                          entrega: entregas[i],
+                          onTap: () => _abrirForm(entrega: entregas[i]),
+                          onDelete: () => _excluir(entregas[i]),
+                          onVerMapa: () => _verNoMapa(entregas[i]),
+                        ),
+                      ),
               ),
-            );
-          }
-          return RefreshIndicator(
-            onRefresh: () async => _recarregar(),
-            child: ListView.separated(
-              padding: const EdgeInsets.fromLTRB(12, 12, 12, 90),
-              itemCount: entregas.length,
-              separatorBuilder: (_, __) => const SizedBox(height: 10),
-              itemBuilder: (_, i) => _EntregaCard(
-                entrega: entregas[i],
-                onTap: () => _abrirForm(entrega: entregas[i]),
-                onDelete: () => _excluir(entregas[i]),
-                onVerMapa: () => _verNoMapa(entregas[i]),
-              ),
-            ),
+            ],
           );
         },
       ),
@@ -273,6 +310,38 @@ class _HomeScreenState extends State<HomeScreen> {
         onPressed: () => _abrirForm(),
         icon: const Icon(Icons.add),
         label: const Text('Nova'),
+      ),
+    );
+  }
+}
+
+/// Faixa que indica se os dados estão sincronizados com o Firebase (online)
+/// ou sendo exibidos a partir do cache local do SQLite (offline).
+class _BannerConexao extends StatelessWidget {
+  final bool online;
+  const _BannerConexao({required this.online});
+
+  @override
+  Widget build(BuildContext context) {
+    final cor = online ? const Color(0xFF16A34A) : const Color(0xFFEA580C);
+    return Container(
+      width: double.infinity,
+      color: cor.withValues(alpha: .12),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(online ? Icons.cloud_done_outlined : Icons.cloud_off_outlined,
+              size: 16, color: cor),
+          const SizedBox(width: 6),
+          Text(
+            online
+                ? 'Sincronizado em tempo real com o Firebase'
+                : 'Offline — exibindo dados locais (SQLite)',
+            style: TextStyle(
+                fontSize: 12, color: cor, fontWeight: FontWeight.w600),
+          ),
+        ],
       ),
     );
   }
@@ -889,7 +958,8 @@ class _EntregaFormScreenState extends State<EntregaFormScreen> {
     if (!_formKey.currentState!.validate()) return;
     setState(() => _salvando = true);
     final e = Entrega(
-      id: widget.entrega?.id,
+      // Mantém o id ao editar; gera um novo (válido nos dois bancos) ao criar.
+      id: widget.entrega?.id ?? novoIdEntrega(),
       codigo: _codigoCtrl.text.trim(),
       destinatario: _destinatarioCtrl.text.trim(),
       endereco: _enderecoCtrl.text.trim(),
@@ -899,10 +969,11 @@ class _EntregaFormScreenState extends State<EntregaFormScreen> {
           double.tryParse(_lngCtrl.text.replaceAll(',', '.')) ?? 0,
       dataEntrega: DateTime.now().toIso8601String(),
     );
+    // Grava nos DOIS bancos (SQLite + Realtime Database).
     if (widget.entrega == null) {
-      await DatabaseHelper.instance.insertEntrega(e);
+      await inserirEntrega(e); // crud/insert_data.dart
     } else {
-      await DatabaseHelper.instance.updateEntrega(e);
+      await atualizarEntrega(e); // crud/update_data.dart
     }
     if (mounted) Navigator.of(context).pop(true);
   }
